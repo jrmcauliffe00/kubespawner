@@ -762,6 +762,51 @@ class KubeSpawner(Spawner):
         """,
     )
 
+    vault_injection = Bool(
+        False,
+        config=True,
+        help="""
+        Enable opt-in Vault Agent Injector annotations on spawned pods.
+
+        When enabled, vault annotations are rendered from the configured
+        templates and added to the pod metadata.
+        """,
+    )
+
+    vault_annotations = Dict(
+        config=True,
+        help="""
+        Static Vault-related annotations to add when vault_injection is enabled.
+        """,
+    )
+
+    vault_annotation_templates = Dict(
+        config=True,
+        help="""
+        Vault annotations rendered as templates when vault_injection is enabled.
+        """,
+    )
+
+    vault_secret_path_whitelist = List(
+        config=True,
+        help="""
+        Optional server-side whitelist of Vault secret paths allowed in the spawn form.
+        """,
+    )
+
+    vault_spawn_form_enabled = Bool(
+        False,
+        config=True,
+        help="""
+        Add a Vault secret path selector to the spawn form when vault injection is enabled.
+        """,
+    )
+
+    vault_spawn_form_label = Unicode(
+        "Vault secret",
+        config=True,
+        help="""Label used for the Vault secret selector in the spawn form.""",
+    )
     extra_annotations = Dict(
         config=True,
         help="""
@@ -2327,6 +2372,7 @@ class KubeSpawner(Spawner):
         annotations["hub.jupyter.org/jupyterhub-version"] = jupyterhub.__version__
 
         annotations.update(extra_annotations)
+        annotations.update(self._build_vault_annotations())
         return annotations
 
     # specify default ssl alt names
@@ -4013,6 +4059,11 @@ class KubeSpawner(Spawner):
         self._validate_user_options(profile_list)
 
         selected_profile = self.user_options.get("profile")
+        if self.vault_spawn_form_enabled:
+            value = self.user_options.get('vault_secret_path')
+            if value and self.vault_secret_path_whitelist and value not in self.vault_secret_path_whitelist:
+                raise ValueError('Selected Vault secret path is not allowed')
+
         if profile_list:
             self._load_profile(selected_profile, profile_list)
         elif selected_profile:

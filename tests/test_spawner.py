@@ -2754,3 +2754,34 @@ async def test_pod_anti_affinity_required():
         spec[1].topology_key
         == pod_anti_affinity_required_dict["02-group-beta"]["topologyKey"]
     )
+
+
+from traitlets.config import Config
+
+
+async def test_vault_annotations_render_and_validate():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_annotations = {
+        'vault.hashicorp.com/agent-inject': 'true',
+    }
+    c.KubeSpawner.vault_annotation_templates = {
+        'vault.hashicorp.com/role': '{username}',
+        'vault.hashicorp.com/path': '/secret/data/jupyter/{server_name}',
+    }
+    spawner = KubeSpawner(config=c, _mock=True)
+    spawner.name = 'lab'
+    annotations = spawner._build_common_annotations({})
+    assert annotations['vault.hashicorp.com/agent-inject'] == 'true'
+    assert annotations['vault.hashicorp.com/role'] == 'mock@name'
+    assert annotations['vault.hashicorp.com/path'] == '/secret/data/jupyter/lab'
+
+async def test_vault_secret_whitelist_rejected():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_spawn_form_enabled = True
+    c.KubeSpawner.vault_secret_path_whitelist = ['/secret/data/jupyter/mock@name']
+    spawner = KubeSpawner(config=c, _mock=True)
+    spawner.user_options = {'vault_secret_path': '/secret/data/other'}
+    with pytest.raises(ValueError):
+        spawner._build_common_annotations({})
