@@ -1,4 +1,5 @@
 <style>{% include 'style.css' %}</style>
+{%- if profile_list %}
 <div class="form-group" id="kubespawner-profiles-list">
   {%- for profile in profile_list %}
     {#- Wrap everything in a label tag so clicking anywhere selects the option #}
@@ -53,6 +54,41 @@
     </label>
   {%- endfor %}
 </div>
+{%- endif %}
+
+{%- if vault_spawn_form_enabled %}
+<div class="form-group" id="kubespawner-vault-secrets">
+  <h3>{{ vault_spawn_form_label }}</h3>
+  {%- if vault_spawn_form_description %}
+    <p class="vault-description">{{ vault_spawn_form_description }}</p>
+  {%- endif %}
+  {%- if vault_secrets %}
+    <div class="vault-secrets-list">
+      {%- for secret in vault_secrets %}
+        {% set selected_ids = user_options.get('vault_secrets', []) if user_options else [] %}
+        {% set checked = secret.id in selected_ids or (not selected_ids and secret.default) %}
+        <label class="vault-secret" for="vault-secret-{{ secret.id }}">
+          <input type="checkbox"
+                 name="vault_secrets"
+                 id="vault-secret-{{ secret.id }}"
+                 value="{{ secret.id }}"
+                 {% if checked %}checked{% endif %} />
+          <span class="vault-secret-body">
+            <span class="vault-secret-name">{{ secret.display_name }}</span>
+            <span class="vault-secret-meta">{{ secret.engine }} · {{ secret.path }}</span>
+            {%- if secret.description %}
+              <span class="vault-secret-description">{{ secret.description }}</span>
+            {%- endif %}
+          </span>
+        </label>
+      {%- endfor %}
+    </div>
+  {%- else %}
+    <p class="vault-empty">No Vault secrets are available for your account.</p>
+  {%- endif %}
+</div>
+{%- endif %}
+
 <script>
   const userOptions = {{ user_options|tojson }};
   $('.js-profile-option-select, .js-profile-option-label').click(function() {

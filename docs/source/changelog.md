@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+#### New features added
+
+- Add opt-in HashiCorp Vault Agent Injector integration (KV + SSH) with a spawn-form secrets picker
+
 ## 7.0
 
 ### [7.1.0] - 2026-06-16

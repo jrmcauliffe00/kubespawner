@@ -59,6 +59,14 @@ from .objects import (
 from .reflector import ResourceReflector
 from .slugs import escape_slug, is_valid_label, multi_slug, safe_slug
 from .utils import recursive_format, recursive_update, sorted_dict_values
+from .vault import (
+    build_vault_inject_annotations,
+    filter_secrets_for_form,
+    list_kv_secrets,
+    normalize_secrets,
+    resolve_selected_secrets,
+    resolve_vault_token,
+)
 
 
 class PodReflector(ResourceReflector):
@@ -766,10 +774,115 @@ class KubeSpawner(Spawner):
         False,
         config=True,
         help="""
-        Enable opt-in Vault Agent Injector annotations on spawned pods.
+        Enable HashiCorp Vault Agent Injector annotations on spawned pods.
 
-        When enabled, vault annotations are rendered from the configured
-        templates and added to the pod metadata.
+        When enabled, KubeSpawner adds annotations that the Vault Agent Injector
+        webhook uses to inject a sidecar which authenticates with Vault via the
+        Kubernetes auth method and renders selected secrets into the pod.
+
+        Requires the Vault Agent Injector in the cluster and a pod service
+        account bound to a Vault Kubernetes auth role (see ``service_account``
+        and ``vault_role``).
+        """,
+    )
+
+    vault_role = Unicode(
+        "{unescaped_username}",
+        config=True,
+        help="""
+        Vault Kubernetes auth role for the injected agent.
+
+        Sets the ``vault.hashicorp.com/role`` annotation. Supports
+        :ref:`templates`. Defaults to the raw JupyterHub username; use
+        ``{username}`` / ``{safe_username}`` if your Vault roles use
+        slugified names.
+        """,
+    )
+
+    vault_auth_path = Unicode(
+        "auth/kubernetes",
+        config=True,
+        help="""
+        Vault auth mount path for Kubernetes auth.
+
+        Sets the ``vault.hashicorp.com/auth-path`` annotation.
+        """,
+    )
+
+    vault_auth_type = Unicode(
+        "kubernetes",
+        config=True,
+        help="""
+        Vault Agent auth type.
+
+        Sets the ``vault.hashicorp.com/auth-type`` annotation. Defaults to
+        Kubernetes auth.
+        """,
+    )
+
+    vault_addr = Unicode(
+        "",
+        config=True,
+        help="""
+        Optional Vault API address used by the Hub to LIST secrets for the
+        spawn form (e.g. ``https://vault.example.com:8200``).
+
+        Not required for injection itself (the injector uses its own Vault
+        address). Only used when ``vault_list_paths`` is configured.
+        """,
+    )
+
+    vault_token = Unicode(
+        "",
+        config=True,
+        help="""
+        Optional Vault token used by the Hub to LIST secrets for the spawn form.
+
+        Prefer injecting via the ``VAULT_TOKEN`` environment variable (see
+        ``vault_token_env``) rather than committing a token into config.
+        """,
+    )
+
+    vault_token_env = Unicode(
+        "VAULT_TOKEN",
+        config=True,
+        help="""
+        Environment variable consulted for a Vault token when ``vault_token``
+        is empty.
+        """,
+    )
+
+    vault_namespace = Unicode(
+        "",
+        config=True,
+        help="""
+        Optional Vault namespace header for Hub-side LIST requests
+        (Vault Enterprise).
+        """,
+    )
+
+    vault_list_paths = List(
+        trait=Unicode(),
+        config=True,
+        help="""
+        Optional Vault paths to LIST when building the spawn-form secret
+        catalog.
+
+        Paths are templated (:ref:`templates`). For KV v2, use the metadata
+        API path, e.g. ``secret/metadata/jupyter/{username}``. Listed keys are
+        merged into ``vault_secrets`` as selectable entries.
+
+        Listing uses the Hub's Vault token; actual secret access at spawn time
+        is still enforced by the pod's Vault Kubernetes auth role/policies.
+        """,
+    )
+
+    vault_list_engine = Enum(
+        ["kv2", "kv"],
+        default_value="kv2",
+        config=True,
+        help="""
+        Secrets engine assumed for paths returned by ``vault_list_paths``.
         """,
     )
 
@@ -777,6 +890,12 @@ class KubeSpawner(Spawner):
         config=True,
         help="""
         Static Vault-related annotations to add when vault_injection is enabled.
+
+        Example::
+
+            c.KubeSpawner.vault_annotations = {
+                "vault.hashicorp.com/agent-pre-populate-only": "true",
+            }
         """,
     )
 
@@ -784,13 +903,67 @@ class KubeSpawner(Spawner):
         config=True,
         help="""
         Vault annotations rendered as templates when vault_injection is enabled.
+
+        Supports :ref:`templates`. Values are expanded before being merged onto
+        the pod.
+        """,
+    )
+
+    vault_secrets = Union(
+        trait_types=[List(trait=Dict()), Callable()],
+        default_value=[],
+        config=True,
+        help="""
+        Catalog of Vault secrets users may select on the spawn form.
+
+        Each entry is a dict::
+
+            {
+                "id": "db-creds",
+                "display_name": "Database credentials",
+                "description": "Postgres role for notebooks",
+                "path": "secret/data/jupyter/{username}/db",
+                "engine": "kv2",  # kv | kv2 | ssh
+                "file": "db.env",  # optional filename under /vault/secrets
+                "file_permission": "0640",  # optional
+                "mount_path": "/vault/secrets",  # optional per-secret mount
+                "template": None,  # optional custom Agent template
+                "key_field": None,  # optional: render one KV field (e.g. private_key)
+                "default": False,  # pre-selected / auto-injected when form off
+            }
+
+        Engines:
+
+        - ``kv`` / ``kv2``: render key/value pairs into a file via Agent templates.
+          Set ``key_field`` (e.g. ``"private_key"``) to inject a single KV value
+          such as an SSH private key stored in KV (defaults file mode to ``0600``).
+        - ``ssh``: SSH secrets engine credentials (``ssh/creds/<role>``); writes
+          ``private_key`` with mode ``0600`` by default
+
+        Path and other string fields support :ref:`templates`.
+
+        May also be a callable ``(spawner) -> list`` (sync or async) that returns
+        catalog entries for the current user — useful for custom Vault ACL
+        discovery.
+        """,
+    )
+
+    vault_secret_whitelist = List(
+        trait=Unicode(),
+        config=True,
+        help="""
+        Optional allowlist of Vault secret ids permitted in the spawn form /
+        user_options. If empty, any id present in the resolved catalog is
+        allowed.
         """,
     )
 
     vault_secret_path_whitelist = List(
+        trait=Unicode(),
         config=True,
         help="""
-        Optional server-side whitelist of Vault secret paths allowed in the spawn form.
+        Optional allowlist of Vault secret paths (after template expansion)
+        permitted for injection. If empty, path checks are skipped.
         """,
     )
 
@@ -798,14 +971,21 @@ class KubeSpawner(Spawner):
         False,
         config=True,
         help="""
-        Add a Vault secret path selector to the spawn form when vault injection is enabled.
+        Add a multi-select Vault secrets picker to the spawn form when
+        ``vault_injection`` is enabled.
         """,
     )
 
     vault_spawn_form_label = Unicode(
-        "Vault secret",
+        "Vault secrets",
         config=True,
-        help="""Label used for the Vault secret selector in the spawn form.""",
+        help="""Label used for the Vault secrets picker in the spawn form.""",
+    )
+
+    vault_spawn_form_description = Unicode(
+        "Select secrets to inject into your server via HashiCorp Vault.",
+        config=True,
+        help="""Help text shown above the Vault secrets picker.""",
     )
     extra_annotations = Dict(
         config=True,
@@ -2372,8 +2552,120 @@ class KubeSpawner(Spawner):
         annotations["hub.jupyter.org/jupyterhub-version"] = jupyterhub.__version__
 
         annotations.update(extra_annotations)
-        annotations.update(self._build_vault_annotations())
         return annotations
+
+    async def _get_vault_secret_catalog(self):
+        """
+        Resolve the Vault secret catalog for the current user.
+
+        Combines ``vault_secrets`` (static list or callable) with optional
+        Vault LIST results from ``vault_list_paths``.
+        """
+        entries = self.vault_secrets
+        if callable(entries):
+            entries = await maybe_future(entries(self))
+        entries = list(entries or [])
+
+        list_paths = self._expand_all(list(self.vault_list_paths or []))
+        if list_paths:
+            token = resolve_vault_token(self.vault_token, self.vault_token_env)
+            if not self.vault_addr or not token:
+                self.log.warning(
+                    "vault_list_paths is set but vault_addr/token are missing; "
+                    "skipping Vault LIST"
+                )
+            else:
+                for list_path in list_paths:
+                    try:
+                        listed = list_kv_secrets(
+                            addr=self.vault_addr,
+                            token=token,
+                            list_path=list_path,
+                            engine=self.vault_list_engine,
+                            namespace=self.vault_namespace or None,
+                        )
+                    except ValueError as e:
+                        self.log.warning("Vault LIST error: %s", e)
+                        continue
+                    # Static catalog entries win over LIST results on id collision
+                    entries.extend(listed)
+
+        # Expand templated string fields on each entry before normalize
+        expanded = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"vault_secrets entries must be dicts, got {type(entry)!r}"
+                )
+            item = dict(entry)
+            for key in (
+                "path",
+                "file",
+                "file_permission",
+                "mount_path",
+                "template",
+                "display_name",
+                "description",
+                "annotation_name",
+                "key_field",
+            ):
+                if isinstance(item.get(key), str):
+                    item[key] = self._expand_user_properties(item[key])
+            expanded.append(item)
+
+        return normalize_secrets(expanded, on_duplicate="keep_first")
+
+    def _build_vault_annotations(self):
+        """
+        Build Vault Agent Injector annotations for the pod.
+
+        Selected secrets come from ``user_options['vault_secrets']`` when the
+        spawn form is enabled; otherwise default/all catalog entries configured
+        on the spawner are used. Catalog entries are expected to already be
+        resolved and stored on ``self._vault_resolved_secrets`` by
+        ``load_user_options``; if missing, only static/templated annotations
+        are applied.
+        """
+        if not self.vault_injection:
+            return {}
+
+        static = dict(self.vault_annotations or {})
+        static.update(self._expand_all(dict(self.vault_annotation_templates or {})))
+
+        secrets = getattr(self, "_vault_resolved_secrets", None)
+        if secrets is None:
+            # Annotations may be built before load_user_options (e.g. unit tests
+            # that only set static templates). Apply auth + static annotations.
+            secrets = []
+
+        role = self._expand_user_properties(self.vault_role) if self.vault_role else ""
+        return build_vault_inject_annotations(
+            secrets=secrets,
+            role=role,
+            auth_path=self.vault_auth_path,
+            auth_type=self.vault_auth_type,
+            static_annotations=static,
+        )
+
+    def _validate_vault_user_options(self, catalog):
+        """Validate vault-related user_options against the resolved catalog."""
+        if not self.vault_spawn_form_enabled:
+            return
+        selected = self.user_options.get("vault_secrets")
+        if selected is None:
+            return
+        if isinstance(selected, str):
+            selected = [selected]
+        if not isinstance(selected, (list, tuple)):
+            raise ValueError("user_options['vault_secrets'] must be a list of secret ids")
+        # resolve_selected_secrets enforces catalog membership + whitelists
+        resolve_selected_secrets(
+            catalog,
+            selected,
+            form_enabled=True,
+            id_whitelist=self.vault_secret_whitelist or None,
+            path_whitelist=self.vault_secret_path_whitelist or None,
+        )
 
     # specify default ssl alt names
     @default("ssl_alt_names")
@@ -2500,6 +2792,8 @@ class KubeSpawner(Spawner):
         annotations = self._build_common_annotations(
             self._expand_all(self.extra_annotations)
         )
+        # Vault Agent Injector annotations apply only to pods
+        annotations.update(self._build_vault_annotations())
 
         return make_pod(
             name=self.pod_name,
@@ -3659,9 +3953,10 @@ class KubeSpawner(Spawner):
     def _env_keep_default(self):
         return []
 
-    def _render_options_form(self, profile_list):
+    def _render_options_form(self, profile_list, vault_secrets=None):
         """
-        Renders a KubeSpawner specific jinja2 template, passing `profile_list` as a variable.
+        Renders a KubeSpawner specific jinja2 template, passing `profile_list`
+        and optional `vault_secrets` as variables.
 
         The template rendered is either:
         - `profile_form_template` if configured
@@ -3677,6 +3972,8 @@ class KubeSpawner(Spawner):
             https://github.com/jupyterhub/jupyterhub/blob/4.0.2/jupyterhub/handlers/base.py#L1272-L1308
         """
         profile_list = self._get_initialized_profile_list(profile_list)
+        if vault_secrets is None:
+            vault_secrets = []
 
         # user_options may be stale (e.g. profile_list changed since the last spawn)
         # or set unvalidated via the REST API, so validate them first and fall back
@@ -3685,6 +3982,8 @@ class KubeSpawner(Spawner):
         if user_options:
             try:
                 self._validate_user_options(profile_list)
+                if self.vault_injection and self.vault_spawn_form_enabled:
+                    self._validate_vault_user_options(vault_secrets)
             except ValueError as e:
                 self.log.warning(
                     f"Not pre-selecting saved user_options on the spawn form "
@@ -3717,23 +4016,47 @@ class KubeSpawner(Spawner):
         else:
             profile_form_template = env.get_template("form.html")
         return profile_form_template.render(
-            profile_list=profile_list, user_options=self.user_options
+            profile_list=profile_list,
+            user_options=user_options,
+            vault_spawn_form_enabled=(
+                self.vault_injection and self.vault_spawn_form_enabled
+            ),
+            vault_spawn_form_label=self.vault_spawn_form_label,
+            vault_spawn_form_description=self.vault_spawn_form_description,
+            vault_secrets=vault_secrets,
         )
 
     async def _render_options_form_dynamically(self, current_spawner):
         """
         A function configured to be used by JupyterHub via
-        `_options_form_default` when `profile_list` is a callable, to render the
-        server options for a user after evaluating the `profile_list` function.
+        `_options_form_default` when `profile_list` / vault catalog is dynamic,
+        to render the server options for a user just in time.
         """
-        profile_list = await maybe_future(self.profile_list(current_spawner))
-        return self._render_options_form(profile_list)
+        profile_list = self.profile_list
+        if callable(profile_list):
+            profile_list = await maybe_future(profile_list(current_spawner))
+        elif profile_list:
+            profile_list = sorted_dict_values(profile_list)
+        else:
+            profile_list = []
+
+        vault_secrets = []
+        if self.vault_injection and self.vault_spawn_form_enabled:
+            catalog = await current_spawner._get_vault_secret_catalog()
+            vault_secrets = filter_secrets_for_form(
+                catalog,
+                id_whitelist=self.vault_secret_whitelist or None,
+                path_whitelist=self.vault_secret_path_whitelist or None,
+            )
+
+        return self._render_options_form(profile_list, vault_secrets=vault_secrets)
 
     @default('options_form')
     def _options_form_default(self):
         """
         Returns a form template for JupyterHub to render, by rendering a
-        KubeSpawner specific template that is passed through the `profile_list` config.
+        KubeSpawner specific template that is passed through the `profile_list`
+        and optional Vault secrets catalog.
 
         JupyterHub renders the returned form template when a user is to start a
         server based on template variables like `spawner`, `for_user`, `user`,
@@ -3747,12 +4070,16 @@ class KubeSpawner(Spawner):
         Reference:
             https://jupyterhub.readthedocs.io/en/stable/reference/spawners.html#spawner-options-form
         """
-        if not self.profile_list:
+        vault_form = self.vault_injection and self.vault_spawn_form_enabled
+        if not self.profile_list and not vault_form:
             return ''
-        if callable(self.profile_list):
-            # Let jupyterhub evaluate the callable profile_list (and render a
-            # form template based on it) just in time by returning a function
-            # doing that
+        if (
+            callable(self.profile_list)
+            or callable(self.vault_secrets)
+            or self.vault_list_paths
+            or vault_form
+        ):
+            # Evaluate just in time so Vault catalogs / callable profiles are fresh
             return self._render_options_form_dynamically
         else:
             # Return the rendered string, as it does not change
@@ -3812,10 +4139,14 @@ class KubeSpawner(Spawner):
                     profile_option_slug = k[len(prefix) :]
                     user_options[profile_option_slug] = v[0]
 
+        # Vault secrets multi-select (checkboxes share name="vault_secrets")
+        if 'vault_secrets' in formdata:
+            user_options['vault_secrets'] = list(formdata.get('vault_secrets') or [])
+
         # warn about any unrecognized form data, which is anything besides
-        # "profile" and "profile-option-" prefixed keys
+        # "profile", "vault_secrets", and "profile-option-" prefixed keys
         unrecognized_keys = set(formdata)
-        unrecognized_keys = unrecognized_keys.difference({"profile"})
+        unrecognized_keys = unrecognized_keys.difference({"profile", "vault_secrets"})
         unrecognized_keys = [
             k for k in unrecognized_keys if not k.startswith("profile-option-")
         ]
@@ -4059,10 +4390,29 @@ class KubeSpawner(Spawner):
         self._validate_user_options(profile_list)
 
         selected_profile = self.user_options.get("profile")
-        if self.vault_spawn_form_enabled:
-            value = self.user_options.get('vault_secret_path')
-            if value and self.vault_secret_path_whitelist and value not in self.vault_secret_path_whitelist:
-                raise ValueError('Selected Vault secret path is not allowed')
+
+        # Resolve Vault secret catalog and selected secrets for pod annotations
+        self._vault_resolved_secrets = []
+        if self.vault_injection:
+            catalog = await self._get_vault_secret_catalog()
+            if self.vault_spawn_form_enabled:
+                self._validate_vault_user_options(catalog)
+            selected = self.user_options.get("vault_secrets")
+            if isinstance(selected, str):
+                selected = [selected]
+            self._vault_resolved_secrets = resolve_selected_secrets(
+                catalog,
+                selected,
+                form_enabled=self.vault_spawn_form_enabled,
+                id_whitelist=self.vault_secret_whitelist or None,
+                path_whitelist=self.vault_secret_path_whitelist or None,
+            )
+            if self._vault_resolved_secrets and not self.service_account:
+                self.log.warning(
+                    "vault_injection is enabled with secrets to inject, but "
+                    "service_account is unset; Vault Kubernetes auth typically "
+                    "requires a non-default service account bound to vault_role"
+                )
 
         if profile_list:
             self._load_profile(selected_profile, profile_list)

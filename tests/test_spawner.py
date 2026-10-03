@@ -2756,32 +2756,179 @@ async def test_pod_anti_affinity_required():
     )
 
 
-from traitlets.config import Config
-
-
-async def test_vault_annotations_render_and_validate():
+async def test_vault_annotations_static_and_templates():
     c = Config()
     c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_role = '{unescaped_username}'
     c.KubeSpawner.vault_annotations = {
-        'vault.hashicorp.com/agent-inject': 'true',
+        'vault.hashicorp.com/agent-pre-populate-only': 'true',
     }
     c.KubeSpawner.vault_annotation_templates = {
-        'vault.hashicorp.com/role': '{username}',
-        'vault.hashicorp.com/path': '/secret/data/jupyter/{server_name}',
+        'vault.hashicorp.com/agent-inject-secret-extra': 'secret/data/jupyter/{servername}',
     }
-    spawner = KubeSpawner(config=c, _mock=True)
-    spawner.name = 'lab'
-    annotations = spawner._build_common_annotations({})
+    user = MockUser(name='mock@name')
+    orm_spawner = Spawner()
+    orm_spawner.name = 'lab'
+    spawner = KubeSpawner(config=c, user=user, orm_spawner=orm_spawner, _mock=True)
+    annotations = spawner._build_vault_annotations()
     assert annotations['vault.hashicorp.com/agent-inject'] == 'true'
     assert annotations['vault.hashicorp.com/role'] == 'mock@name'
-    assert annotations['vault.hashicorp.com/path'] == '/secret/data/jupyter/lab'
+    assert annotations['vault.hashicorp.com/auth-type'] == 'kubernetes'
+    assert annotations['vault.hashicorp.com/auth-path'] == 'auth/kubernetes'
+    assert annotations['vault.hashicorp.com/agent-pre-populate-only'] == 'true'
+    assert (
+        annotations['vault.hashicorp.com/agent-inject-secret-extra']
+        == 'secret/data/jupyter/lab'
+    )
 
-async def test_vault_secret_whitelist_rejected():
+
+async def test_vault_kv_and_ssh_secrets_injected_from_form():
     c = Config()
     c.KubeSpawner.vault_injection = True
     c.KubeSpawner.vault_spawn_form_enabled = True
-    c.KubeSpawner.vault_secret_path_whitelist = ['/secret/data/jupyter/mock@name']
+    c.KubeSpawner.vault_role = 'jupyter'
+    c.KubeSpawner.service_account = 'jupyter'
+    c.KubeSpawner.vault_secrets = [
+        {
+            'id': 'app-config',
+            'path': 'secret/data/jupyter/{unescaped_username}/config',
+            'engine': 'kv2',
+            'file': 'config.env',
+        },
+        {
+            'id': 'ssh-creds',
+            'path': 'ssh/creds/jupyter',
+            'engine': 'ssh',
+        },
+    ]
     spawner = KubeSpawner(config=c, _mock=True)
-    spawner.user_options = {'vault_secret_path': '/secret/data/other'}
-    with pytest.raises(ValueError):
-        spawner._build_common_annotations({})
+    spawner.user_options = {'vault_secrets': ['app-config', 'ssh-creds']}
+    await spawner.load_user_options()
+    annotations = spawner._build_vault_annotations()
+
+    assert annotations['vault.hashicorp.com/role'] == 'jupyter'
+    assert (
+        annotations['vault.hashicorp.com/agent-inject-secret-app-config']
+        == 'secret/data/jupyter/mock@name/config'
+    )
+    assert (
+        annotations['vault.hashicorp.com/agent-inject-file-app-config'] == 'config.env'
+    )
+    assert 'Data.data' in annotations['vault.hashicorp.com/agent-inject-template-app-config']
+    assert (
+        annotations['vault.hashicorp.com/agent-inject-secret-ssh-creds']
+        == 'ssh/creds/jupyter'
+    )
+    assert annotations['vault.hashicorp.com/agent-inject-file-ssh-creds'] == 'id_rsa'
+    assert (
+        annotations['vault.hashicorp.com/agent-inject-file-permission-ssh-creds']
+        == '0600'
+    )
+    assert (
+        'private_key'
+        in annotations['vault.hashicorp.com/agent-inject-template-ssh-creds']
+    )
+
+
+async def test_vault_secret_path_whitelist_rejected():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_spawn_form_enabled = True
+    c.KubeSpawner.vault_secret_path_whitelist = [
+        'secret/data/jupyter/mock@name/allowed'
+    ]
+    c.KubeSpawner.vault_secrets = [
+        {
+            'id': 'allowed',
+            'path': 'secret/data/jupyter/{unescaped_username}/allowed',
+            'engine': 'kv2',
+        },
+        {
+            'id': 'other',
+            'path': 'secret/data/jupyter/{unescaped_username}/other',
+            'engine': 'kv2',
+        },
+    ]
+    spawner = KubeSpawner(config=c, _mock=True)
+    spawner.user_options = {'vault_secrets': ['other']}
+    with pytest.raises(ValueError, match='not allowed'):
+        await spawner.load_user_options()
+
+
+async def test_vault_secret_id_whitelist_rejected():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_spawn_form_enabled = True
+    c.KubeSpawner.vault_secret_whitelist = ['allowed']
+    c.KubeSpawner.vault_secrets = [
+        {'id': 'allowed', 'path': 'secret/data/a', 'engine': 'kv2'},
+        {'id': 'other', 'path': 'secret/data/b', 'engine': 'kv2'},
+    ]
+    spawner = KubeSpawner(config=c, _mock=True)
+    spawner.user_options = {'vault_secrets': ['other']}
+    with pytest.raises(ValueError, match='vault_secret_whitelist'):
+        await spawner.load_user_options()
+
+
+async def test_vault_options_from_form():
+    spawner = KubeSpawner(_mock=True)
+    formdata = {
+        'profile': ['demo'],
+        'vault_secrets': ['app-config', 'ssh-creds'],
+        'profile-option-demo--image': ['minimal'],
+    }
+    options = spawner._options_from_form(formdata)
+    assert options['profile'] == 'demo'
+    assert options['image'] == 'minimal'
+    assert options['vault_secrets'] == ['app-config', 'ssh-creds']
+
+
+async def test_vault_spawn_form_renders_secrets():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_spawn_form_enabled = True
+    c.KubeSpawner.vault_secrets = [
+        {
+            'id': 'app-config',
+            'display_name': 'App config',
+            'path': 'secret/data/jupyter/{unescaped_username}/config',
+            'engine': 'kv2',
+            'default': True,
+        }
+    ]
+    spawner = KubeSpawner(config=c, _mock=True)
+    html = await spawner._render_options_form_dynamically(spawner)
+    assert 'kubespawner-vault-secrets' in html
+    assert 'name="vault_secrets"' in html
+    assert 'value="app-config"' in html
+    assert 'App config' in html
+    assert 'secret/data/jupyter/mock@name/config' in html
+    assert 'checked' in html
+
+
+async def test_vault_annotations_not_on_common_resources():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_secrets = [
+        {'id': 'app', 'path': 'secret/data/app', 'engine': 'kv2', 'default': True},
+    ]
+    spawner = KubeSpawner(config=c, _mock=True)
+    await spawner.load_user_options()
+    common = spawner._build_common_annotations({})
+    assert 'vault.hashicorp.com/agent-inject' not in common
+    vault = spawner._build_vault_annotations()
+    assert vault['vault.hashicorp.com/agent-inject'] == 'true'
+    assert 'vault.hashicorp.com/agent-inject-secret-app' in vault
+
+
+async def test_vault_empty_form_selection_skips_sidecar():
+    c = Config()
+    c.KubeSpawner.vault_injection = True
+    c.KubeSpawner.vault_spawn_form_enabled = True
+    c.KubeSpawner.vault_secrets = [
+        {'id': 'app', 'path': 'secret/data/app', 'engine': 'kv2'},
+    ]
+    spawner = KubeSpawner(config=c, _mock=True)
+    spawner.user_options = {'vault_secrets': []}
+    await spawner.load_user_options()
+    assert spawner._build_vault_annotations() == {}
